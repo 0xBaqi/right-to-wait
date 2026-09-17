@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createClient, isSuccessful } from "genlayer-js";
 import { studioDevnet } from "genlayer-js/chains";
 import "./App.css";
@@ -9,6 +9,96 @@ const CONTRACT_ADDRESS =
 const client = createClient({
   chain: studioDevnet,
 });
+
+
+// Use the SDK's EIP-1193 provider contract without conflicting with wallet
+// extensions or existing global Window declarations in the host project.
+type EIP1193Provider = NonNullable<
+  NonNullable<Parameters<typeof createClient>[0]>["provider"]
+>;
+type InjectedProvider = EIP1193Provider & {
+  isMetaMask?: boolean;
+  isOkxWallet?: boolean;
+  isOKExWallet?: boolean;
+  providers?: InjectedProvider[];
+};
+type WalletWindow = Window & {
+  ethereum?: InjectedProvider;
+  okxwallet?: InjectedProvider;
+};
+type WalletType = "okx" | "metamask";
+
+const STUDIO_CHAIN_ID = 61997;
+const STUDIO_CHAIN_HEX = "0xf22d";
+
+function getWalletProvider(type: WalletType): InjectedProvider {
+  const injectedWindow = window as WalletWindow;
+  if (type === "okx") {
+    if (!injectedWindow.okxwallet) {
+      throw new Error("OKX Wallet is not installed. Install or enable it, then refresh this page.");
+    }
+    return injectedWindow.okxwallet;
+  }
+
+  const injected = injectedWindow.ethereum;
+  const candidates = [...(injected?.providers ?? []), ...(injected ? [injected] : [])];
+  const metamask = candidates.find((provider) =>
+    provider.isMetaMask === true &&
+    provider !== injectedWindow.okxwallet &&
+    !provider.isOkxWallet && !provider.isOKExWallet
+  );
+  if (!metamask) {
+    throw new Error("MetaMask is not installed or available. Enable MetaMask, then refresh this page.");
+  }
+  return metamask;
+}
+
+function firstAccount(accounts: unknown): `0x${string}` {
+  if (!Array.isArray(accounts) || typeof accounts[0] !== "string" ||
+      !/^0x[0-9a-fA-F]{40}$/.test(accounts[0])) {
+    throw new Error("No wallet account is available. Unlock your wallet and connect again.");
+  }
+  return accounts[0] as `0x${string}`;
+}
+
+function isUnknownChain(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const value = error as { code?: unknown; data?: { originalError?: { code?: unknown } } };
+  return Number(value.code) === 4902 || Number(value.data?.originalError?.code) === 4902;
+}
+
+async function ensureStudioDevChain(provider: EIP1193Provider) {
+  if (studioDevnet.id !== STUDIO_CHAIN_ID) {
+    throw new Error("The installed GenLayer SDK's studioDevnet must use chain 61997.");
+  }
+  const currentChain = await provider.request({ method: "eth_chainId" });
+  if (Number(currentChain) === STUDIO_CHAIN_ID) return;
+  try {
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: STUDIO_CHAIN_HEX }],
+    });
+  } catch (error) {
+    if (!isUnknownChain(error)) throw error;
+    await provider.request({
+      method: "wallet_addEthereumChain",
+      params: [{
+        chainId: STUDIO_CHAIN_HEX,
+        chainName: studioDevnet.name,
+        nativeCurrency: studioDevnet.nativeCurrency,
+        rpcUrls: [...studioDevnet.rpcUrls.default.http],
+        blockExplorerUrls: ["https://explorer-studio-dev.genlayer.com"],
+      }],
+    });
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: STUDIO_CHAIN_HEX }],
+    });
+  }
+  if (Number(await provider.request({ method: "eth_chainId" })) !== STUDIO_CHAIN_ID) {
+    throw new Error("Switch your selected wallet to GenLayer Studio Dev (61997) and try again.");
+  }
+}
 
 type ProtocolState = {
   action: string;
@@ -28,91 +118,58 @@ const initialState: ProtocolState = {
 
 function App() {
   const [wallet, setWallet] = useState("");
+  const [walletProvider, setWalletProvider] = useState<InjectedProvider | null>(null);
+  const [showWalletChoices, setShowWalletChoices] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const connectionPending = useRef(false);
 const [txStatus, setTxStatus] = useState("");
 const [newEvidence, setNewEvidence] = useState(
   "New market information indicates significantly increased execution risk that was not available when the original action was proposed."
 );
-async function connectWallet() {
+async function connectWallet(type: WalletType) {
+  if (connectionPending.current) return;
+  connectionPending.current = true;
+  setConnecting(true);
   try {
-    const ethereum = (window as any).ethereum;
-
-    if (!ethereum) {
-      throw new Error("No browser wallet detected.");
-    }
-
-    const accounts = (await ethereum.request({
-      method: "eth_requestAccounts",
-    })) as string[];
-
-    if (!accounts[0]) {
-      throw new Error("No wallet account returned.");
-    }
-
-    const walletAddress = accounts[0] as `0x${string}`;
-
-    const chainIdHex = "0xF22D"; // 61997
-
-    try {
-      await ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: chainIdHex }],
-      });
-    } catch (switchError: any) {
-      if (switchError.code === 4902) {
-        await ethereum.request({
-          method: "wallet_addEthereumChain",
-          params: [
-            {
-              chainId: chainIdHex,
-              chainName: "GenLayer Studio Dev",
-              nativeCurrency: {
-                name: "GEN",
-                symbol: "GEN",
-                decimals: 18,
-              },
-              rpcUrls: ["https://studio-dev.genlayer.com/api"],
-              blockExplorerUrls: [
-                "https://explorer-studio-dev.genlayer.com",
-              ],
-            },
-          ],
-        });
-      } else {
-        throw switchError;
-      }
-    }
-
-    setWallet(walletAddress);
-    setTxStatus("Wallet connected to GenLayer Studio Dev");
+    const provider = getWalletProvider(type);
+    setTxStatus("Confirm connection in your wallet…");
+    await provider.request({ method: "eth_requestAccounts" });
+    await ensureStudioDevChain(provider);
+    const account = firstAccount(await provider.request({ method: "eth_accounts" }));
+    setWalletProvider(provider);
+    setWallet(account);
+    setShowWalletChoices(false);
+    setTxStatus("");
   } catch (err) {
-    console.error(err);
-
-    setTxStatus(
-      err instanceof Error
-        ? err.message
-        : JSON.stringify(err, null, 2)
-    );
+    setTxStatus(err instanceof Error ? err.message : String(err));
+  } finally {
+    connectionPending.current = false;
+    setConnecting(false);
   }
 }
+
+async function getSelectedWalletClient() {
+  const provider = walletProvider;
+  if (!provider) throw new Error("Connect your wallet first.");
+  await ensureStudioDevChain(provider);
+  const accounts = await provider.request({ method: "eth_accounts" });
+  if (Array.isArray(accounts) && accounts.length === 0) {
+    setWallet("");
+    setWalletProvider(null);
+    setShowWalletChoices(true);
+    throw new Error("Your wallet is disconnected or locked. Connect your wallet again.");
+  }
+  const account = firstAccount(accounts);
+  setWallet(account);
+  return createClient({ chain: studioDevnet, account, provider });
+}
+
 async function requestWait() {
   try {
-    const ethereum = (window as any).ethereum;
-
-    if (!ethereum) {
-      throw new Error("Connect a browser wallet first.");
-    }
-
-    if (!wallet) {
-      throw new Error("Connect your wallet first.");
-    }
 
     setTxStatus("Preparing challenge…");
 
-    const walletClient = createClient({
-      chain: studioDevnet,
-      account: wallet as `0x${string}`,
-      provider: ethereum,
-    });
+    const walletClient = await getSelectedWalletClient();
 
     const write = {
       address: CONTRACT_ADDRESS,
@@ -165,15 +222,6 @@ async function requestWait() {
 
 async function submitEvidence() {
   try {
-    const ethereum = (window as any).ethereum;
-
-    if (!ethereum) {
-      throw new Error("No browser wallet detected.");
-    }
-
-    if (!wallet) {
-      throw new Error("Connect your wallet first.");
-    }
 
     if (!newEvidence.trim()) {
       throw new Error("Evidence cannot be empty.");
@@ -181,11 +229,7 @@ async function submitEvidence() {
 
     setTxStatus("Preparing evidence transaction…");
 
-    const walletClient = createClient({
-      chain: studioDevnet,
-      account: wallet as `0x${string}`,
-      provider: ethereum,
-    });
+    const walletClient = await getSelectedWalletClient();
 
     const write = {
       address: CONTRACT_ADDRESS,
@@ -235,23 +279,10 @@ async function submitEvidence() {
 
 async function resolveWait() {
   try {
-    const ethereum = (window as any).ethereum;
-
-    if (!ethereum) {
-      throw new Error("No browser wallet detected.");
-    }
-
-    if (!wallet) {
-      throw new Error("Connect your wallet first.");
-    }
 
     setTxStatus("Preparing GenLayer judgment…");
 
-    const walletClient = createClient({
-      chain: studioDevnet,
-      account: wallet as `0x${string}`,
-      provider: ethereum,
-    });
+    const walletClient = await getSelectedWalletClient();
 
     const write = {
       address: CONTRACT_ADDRESS,
@@ -551,12 +582,30 @@ return (
             ["PENDING", "PAUSED", "EVIDENCE_RECEIVED"].includes(
               data.status
             ) && (
-              <button
-                className="primaryButton"
-                onClick={connectWallet}
-              >
-                CONNECT WALLET
-              </button>
+              <div>
+                <button
+                  className="primaryButton"
+                  onClick={() => setShowWalletChoices((shown) => !shown)}
+                  disabled={connecting}
+                  aria-expanded={showWalletChoices}
+                  aria-controls="walletChoices"
+                >
+                  CONNECT WALLET
+                </button>
+                {showWalletChoices && (
+                  <div id="walletChoices" role="group" aria-label="Choose wallet"
+                    style={{ display: "flex", gap: "12px", flexWrap: "wrap", marginTop: "12px" }}>
+                    <button className="primaryButton" disabled={connecting}
+                      onClick={() => { void connectWallet("okx"); }}>
+                      OKX WALLET
+                    </button>
+                    <button className="primaryButton" disabled={connecting}
+                      onClick={() => { void connectWallet("metamask"); }}>
+                      METAMASK
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
 
           {wallet && data.status === "PENDING" && (
